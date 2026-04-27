@@ -147,9 +147,9 @@ def collate_timeseries(batch):
             
     return x_reshaped, lengths, labels
 class MultiModalRealDataset(Dataset):
-    def __init__(self, 
-                 photonic_digit_path="../data/dataset_photonic.npz", 
-                 photonic_letter_dir="../data", 
+    def __init__(self, selected_train_id,
+                 photonic_digit_path="/mnt/d/shadow_to_ink/data/dataset_photonic.npz", 
+                 data_path="/mnt/d/shadow_to_ink/data/model_data.npz",           
                  use_mnist=True, use_emnist=True,
                  transform=None, mode="train", split_ratio=0.8,
                  aug_npz_path=None, angle = 0,
@@ -171,7 +171,7 @@ class MultiModalRealDataset(Dataset):
             "emnist": []
         }
 
-        if os.path.exists(photonic_digit_path) and self.subset in ["all", "digit"]:
+        if self.subset in ["all", "digit"]:
             data = np.load("dataset_photonic.npz", allow_pickle=True)
             if mode == "train":
                 X, y = data["X_train"], data["y_train"]
@@ -200,10 +200,32 @@ class MultiModalRealDataset(Dataset):
                 self.source_stats["photonic_digit"].append(int(l))
         n_aug_per_sample = 20
 
-        if os.path.isdir(photonic_letter_dir) and self.subset in ["all", "letter"]:
-            X = np.load(os.path.join(photonic_letter_dir, f"X_{mode}.npy"), allow_pickle=True)
-            y = np.load(os.path.join(photonic_letter_dir, f"y_{mode}.npy"), allow_pickle=True)
-            for s, l in zip(X, y):
+        
+        
+        # --- A. 加载真实数据 ---
+        if self.subset in ["all", "letter"]:
+            data = np.load(data_path)
+            train_ids = [selected_train_id, 12] 
+            # 注意：请把你的所有数据保存为 X_all.npy, y_all.npy, ids_all.npy
+            # 或者从你已经合并好的 dict 中读取
+            X_all = data['x']
+            y_all = data['y']
+            ids_all = data['ids']
+            
+            for s, l, uid in zip(X_all, y_all, ids_all):
+                uid = int(uid)
+                
+                # --- 动态数据过滤逻辑 ---
+                if mode == "train":
+                    # 如果当前是训练模式，但该样本的 uid 不在 train_ids 里，丢弃
+                    if uid not in train_ids:
+                        continue 
+                elif mode == "test":
+                    # 如果当前是测试模式，排除掉被选作训练集的人（包括专家12号）
+                    if uid in train_ids:
+                        continue 
+                
+                # 记录符合条件的样本
                 symbol_idx = int(l) + 10
                 ts = torch.tensor(s, dtype=torch.float32)
 
@@ -212,21 +234,21 @@ class MultiModalRealDataset(Dataset):
                     "reference_image": None,
                     "symbol_idx": symbol_idx,
                     "symbol_type": "letter",
+                    "uid": uid,  # 🚨 关键！必须把 uid 存进字典，缓存器才能认出是谁写的！
                     "is_aug": False
                 })
                 self.source_stats["photonic_letter"].append(symbol_idx)
 
+        # --- B. 加载增强数据 (仅限 Train) ---
         if mode == "train" and aug_npz_path is not None and os.path.exists(aug_npz_path) and self.subset in ["all", "letter"]:
             print(f"[Dataset] Loading augmented data from {aug_npz_path} ...")
             aug_data = np.load(aug_npz_path, allow_pickle=True)
             
-
             X_aug = aug_data['X']
             y_aug = aug_data['y']
 
             count_aug = 0
             for s, l in zip(X_aug, y_aug):
-
                 symbol_idx = int(l) + 10 
                 s = s.astype(np.float32)
                 ts = torch.tensor(s, dtype=torch.float32)
@@ -626,7 +648,11 @@ class CNN_GRU_Attn_Strict_Proto(nn.Module):
                           batch_first=True,
                           bidirectional=False)
         self.dropout_after_gru = nn.Dropout(dropout_p)
-
+        self.proto_projector = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.ReLU(),
+            nn.Linear(embed_dim, embed_dim)
+        )
         # Attention
         self.attn = SeqSelfAttentionTorch(feature_dim=num_lstm_neuron,
                                           units=attn_units,
@@ -813,7 +839,7 @@ class CNN_GRU_ResNet_Wrapper(nn.Module):
         
         self.spec_dim = spec_n_mfcc * 3
 
-        if fusion_mode in ['time', 'hybrid']:
+        if fusion_mode in ['time', 'hybrid','mfcc']:
             self.conv = nn.Conv1d(in_channels=n_features, out_channels=num_filter,
                                   kernel_size=num_kernel, padding=0)
             self.bn_conv = nn.BatchNorm1d(num_filter)
@@ -842,7 +868,7 @@ class CNN_GRU_ResNet_Wrapper(nn.Module):
         else:
             resnet_out_dim = 0
 
-        if fusion_mode == 'hybrid':
+        if fusion_mode in ['hybrid', 'mfcc']:
             fc_in_dim = time_out_dim + self.spec_dim
         elif fusion_mode == 'time':
             fc_in_dim = time_out_dim
@@ -888,7 +914,7 @@ class CNN_GRU_ResNet_Wrapper(nn.Module):
 
         h_final = None
 
-        if self.fusion_mode in ['time', 'hybrid']:
+        if self.fusion_mode in ['time', 'hybrid', 'mfcc']:
             # Permute -> (B, Fea, L)
             h = x_flat.permute(0, 2, 1)
             h = self.conv(h)
@@ -906,10 +932,10 @@ class CNN_GRU_ResNet_Wrapper(nn.Module):
             
             h_final = h_time
 
-        if self.fusion_mode in ['tecc', 'hybrid']:
+        if self.fusion_mode in ['tecc', 'hybrid', 'mfcc']:
             h_spec = self.spec_extractor(x, output_format="vector") 
             
-            if self.fusion_mode == 'hybrid':
+            if self.fusion_mode in ['hybrid', 'mfcc']:
                 h_final = torch.cat([h_time, h_spec], dim=-1)
             else:
                 h_final = h_spec
@@ -1080,7 +1106,6 @@ def train_one_epoch(model, loader, optimizer, device, epoch, mode="single", k=3,
             is_aug = None
         labels = labels
         seqs, labels = seqs.to(device), labels.to(device)
-        
         if epoch < 20:
             current_beta = 0.0
             current_beta_onhw = 0.0
@@ -1314,3 +1339,204 @@ def compute_photonic_stats(dataset):
     std  = torch.sqrt(torch.clamp(var, min=1e-6))
 
     return mean, std
+
+import torch
+import torch.nn.functional as F
+import numpy as np
+import random
+from collections import defaultdict
+
+def build_prefix_tree(lexicon):
+    """根据词典构建合法前缀集合，用于快速剪枝"""
+    prefixes = set()
+    for word in lexicon:
+        for i in range(1, len(word) + 1):
+            prefixes.add(word[:i])
+    return prefixes
+
+def lexicon_beam_search(logits_seq, lexicon, class_names, beam_width=20, temperature=2.0, eps=1e-3):
+    """
+    火力全开版波束搜索
+    - beam_width: 增加到 20 或 50
+    - temperature: >1.0 使概率分布变平滑，缓解过度自信
+    - eps: 保底概率，防止单个字母的失误毁掉整个单词
+    """
+    valid_prefixes = build_prefix_tree(lexicon)
+    L = logits_seq.shape[0]
+    beams = [("", 0.0)]
+    
+    if not isinstance(logits_seq, torch.Tensor):
+        logits_seq = torch.tensor(logits_seq)
+        
+    # 🚨 魔法 1：温度缩放 (Temperature Scaling)
+    scaled_logits = logits_seq / temperature
+    
+    # 获取 softmax 概率
+    probs = F.softmax(scaled_logits, dim=-1).cpu().numpy()
+    
+    for i in range(L):
+        new_beams = []
+        current_probs = probs[i]
+        
+        # 🚨 魔法 2：极值保护 (Smoothing)
+        # 给所有概率加一个保底值，然后重新归一化
+        smoothed_probs = current_probs + eps
+        smoothed_probs = smoothed_probs / smoothed_probs.sum()
+        
+        # 转为 log 概率计算
+        log_probs = np.log(smoothed_probs)
+        
+        for prefix, score in beams:
+            for char_idx, char_log_prob in enumerate(log_probs):
+                next_char = class_names[char_idx].upper() 
+                new_prefix = prefix + next_char
+                new_score = score + char_log_prob
+                
+                # 前缀字典剪枝
+                if new_prefix in valid_prefixes:
+                    new_beams.append((new_prefix, new_score))
+        
+        if not new_beams:
+            raw_pred = "".join([class_names[p].upper() for p in logits_seq.argmax(dim=-1).cpu().numpy()])
+            return raw_pred
+            
+        new_beams = sorted(new_beams, key=lambda x: x[1], reverse=True)
+        # 🚨 魔法 3：保留更多的搜索分支
+        beams = new_beams[:beam_width]
+
+    final_candidates = [b for b in beams if b[0] in lexicon]
+    
+    if final_candidates:
+        return final_candidates[0][0]
+    else:
+        raw_pred = "".join([class_names[p].upper() for p in logits_seq.argmax(dim=-1).cpu().numpy()])
+        return raw_pred
+
+
+class UserDataCache:
+    def __init__(self, test_dataset, class_names):
+        """
+        将离散的 test_dataset 按照 User ID 和 Character 进行重组
+        假设 test_dataset 中可以获取 uid 和 symbol_idx
+        """
+        self.class_names = class_names
+        # 结构: cache[uid][char_upper] = [tensor1, tensor2, ...]
+        self.cache = defaultdict(lambda: defaultdict(list))
+        
+        print("正在构建用户级测试数据缓存...")
+        # 注意：这里假设你的 test_dataset 可以遍历，且返回的信息中包含 uid
+        # 如果你的 Dataset 原本没有保存 uid，你需要在 Dataset 的 __getitem__ 中把 uid 返回出来
+        for sample in test_dataset:
+            # 假设你的 sample 长这样: x, y, uid
+            x = sample['time_series']
+            y = sample['symbol_idx']
+            uid = sample.get('uid', 0) # 请根据你实际的代码修改键值
+            
+            char_upper = self.class_names[y].upper()
+            self.cache[uid][char_upper].append(x)
+            
+    def get_word_sequence(self, word, uid, n_steps=200, n_length=5):
+        """为特定用户抽取组成该单词的特征序列，并严格保持与 DataLoader 相同的维度对齐"""
+        word = word.upper()
+        seq_tensors = []
+        total_len = n_steps * n_length
+        
+        for char in word:
+            available_samples = self.cache[uid][char]
+            if not available_samples:
+                # 极端情况：这个用户恰好没有写过这个字母，返回 None 忽略这个词
+                return None 
+            
+            # 随机抽取一个该字母的 One-shot 样本 (加上 clone 防止修改原数据)
+            x = random.choice(available_samples).clone()
+            feat_dim = x.size(1)
+            
+            # =======================================================
+            # 🚨 核心对齐：完美复刻 collate_fn 的逻辑
+            # =======================================================
+            if x.size(0) < total_len:
+                pad_len = total_len - x.size(0)
+                x = torch.cat([x, torch.zeros(pad_len, feat_dim, dtype=x.dtype, device=x.device)], dim=0)
+            elif x.size(0) > total_len:
+                x = x[:total_len, :]
+
+            # reshape -> (200, 5, 9)
+            x = x.view(n_steps, n_length, feat_dim)
+            
+            seq_tensors.append(x)
+            
+        # 拼成一个 Batch: Shape 将会是 [单词长度, 200, 5, 9]
+        return torch.stack(seq_tensors)
+
+def evaluate_word_recognition(model, user_cache, lexicon_file, device, class_names, test_uids):
+    # 1. 加载测试词典
+    with open(lexicon_file, 'r') as f:
+        lexicon = set([line.strip().upper() for line in f if line.strip()])
+    
+    print(f"\n====================================================")
+    print(f"📊 开始词汇级评估 | 词典大小: {len(lexicon)} 词")
+    print(f"====================================================")
+    
+    model.eval()
+    total_words = 0
+    raw_correct = 0      # 无词典纠错的准确率
+    system_correct = 0   # 有词典纠错的准确率
+    
+    # 为了避免测试时间过长，我们可以从词典中随机抽取 500 个词作为测试集
+    test_words = random.sample(list(lexicon), min(500, len(lexicon)))
+    
+    with torch.no_grad():
+        for uid in test_uids:
+            for target_word in test_words:
+                
+                # 抽取该用户组成这个词的特征 [L, Fea]
+                x_seq = user_cache.get_word_sequence(target_word, uid)
+                if x_seq is None:
+                    continue # 该用户缺字母数据，跳过
+                
+                # 送入模型 (x_seq 现在已经是完美的 [B, 200, 5, 9] 了)
+                x_seq = x_seq.to(device)
+                out = model(x_seq, return_emb=False)
+                
+                # 安全解析模型返回的 Logits
+                if isinstance(out, tuple):
+                    for tensor in out:
+                        # 找到那个 shape 为 [Batch, 37] 的分类张量
+                        if isinstance(tensor, torch.Tensor) and tensor.dim() == 2 and tensor.shape[1] == len(class_names):
+                            logits = tensor
+                            break
+                else:
+                    logits = out
+                
+                # A. Raw Accuracy (直接拼接 Argmax)
+                raw_pred_indices = logits.argmax(dim=-1).cpu().numpy()
+                raw_pred_word = "".join([class_names[idx].upper() for idx in raw_pred_indices])
+                if raw_pred_word == target_word:
+                    raw_correct += 1
+                
+                # B. System Accuracy (加入词典与 Beam Search)
+                system_pred_word = lexicon_beam_search(
+                    logits, lexicon, class_names, 
+                    beam_width=20,      # 可以大胆开到 20 甚至 50
+                    temperature=2.0,    # 推荐 1.5 到 3.0 之间
+                    eps=0.01            # 给 1% 的容错率
+                )
+                if system_pred_word == target_word:
+                    system_correct += 1
+                    
+                total_words += 1
+
+    if total_words == 0:
+        print("🚨 [错误] 成功组装的单词数量为 0！请检查 test_dataset 是否正确输出了 'uid'，或者该用户的测试集中是否缺少某些字母！")
+        return 0.0, 0.0
+        
+    # 计算最终准确率
+    raw_acc = (raw_correct / total_words) * 100
+    sys_acc = (system_correct / total_words) * 100
+    
+    print(f"测试总词数: {total_words}")
+    print(f"底层 Raw Word Acc (无纠错): {raw_acc:.2f}%")
+    print(f"🚀 系统级 Word Acc (带纠错): {sys_acc:.2f}%")
+    
+    return raw_acc, sys_acc
+
