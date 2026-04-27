@@ -1355,12 +1355,7 @@ def build_prefix_tree(lexicon):
     return prefixes
 
 def lexicon_beam_search(logits_seq, lexicon, class_names, beam_width=20, temperature=2.0, eps=1e-3):
-    """
-    火力全开版波束搜索
-    - beam_width: 增加到 20 或 50
-    - temperature: >1.0 使概率分布变平滑，缓解过度自信
-    - eps: 保底概率，防止单个字母的失误毁掉整个单词
-    """
+
     valid_prefixes = build_prefix_tree(lexicon)
     L = logits_seq.shape[0]
     beams = [("", 0.0)]
@@ -1482,7 +1477,6 @@ def evaluate_word_recognition(model, user_cache, lexicon_file, device, class_nam
     raw_correct = 0      # 无词典纠错的准确率
     system_correct = 0   # 有词典纠错的准确率
     
-    # 为了避免测试时间过长，我们可以从词典中随机抽取 500 个词作为测试集
     test_words = random.sample(list(lexicon), min(500, len(lexicon)))
     
     with torch.no_grad():
@@ -1494,7 +1488,6 @@ def evaluate_word_recognition(model, user_cache, lexicon_file, device, class_nam
                 if x_seq is None:
                     continue # 该用户缺字母数据，跳过
                 
-                # 送入模型 (x_seq 现在已经是完美的 [B, 200, 5, 9] 了)
                 x_seq = x_seq.to(device)
                 out = model(x_seq, return_emb=False)
                 
